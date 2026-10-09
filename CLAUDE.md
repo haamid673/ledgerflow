@@ -2,7 +2,7 @@
 
 ## 1. Purpose
 
-LedgerFlow is a transaction-processing backend focused on financial correctness, idempotent operations, concurrency safety, immutable double-entry accounting, reliable event processing, and (planned) reconciliation and recovery.
+LedgerFlow is a transaction-processing backend focused on financial correctness, idempotent operations, concurrency safety, immutable double-entry accounting, reliable event processing (an at-least-once outbox worker is implemented), and (planned, not yet implemented) reconciliation and recovery.
 
 It is an **educational portfolio project, not production banking software**. The engineering problem is the product: correctness over feature count, explicit designs the owner can defend in an interview. Time is limited (about one month, shared with another project), so prefer a working, demonstrable system over a theoretical one.
 
@@ -12,15 +12,16 @@ It is an **educational portfolio project, not production banking software**. The
 - PostgreSQL 16; schema managed by golang-migrate. Migrations in `migrations/` are embedded into the binary (`migrations/embed.go`) and applied on API start when `AUTO_MIGRATE=true` (default) and by the test helper.
 - Docker Compose: `postgres` (host port **5433**, to avoid clashing with other local Postgres instances) and `api` (port 8080).
 - Tests: Go `testing`, `httptest`, real PostgreSQL.
-- Config via env vars (`internal/config`): `DATABASE_URL` (required), `HTTP_ADDR`, `AUTO_MIGRATE`, `DEV_ENDPOINTS`. See `.env.example`.
+- Config via env vars (`internal/config`): `DATABASE_URL` (required), `HTTP_ADDR` (default `:8080`), `AUTO_MIGRATE` (default true), `DEV_ENDPOINTS` (default false), plus the outbox worker settings in §6. `.env.example` lists only the first group; the `OUTBOX_*` variables are not in it and `docker-compose.yml` does not pass them, so the containerized API uses the defaults.
 
-Layout: `cmd/api` (entrypoint, graceful shutdown), `internal/config`, `internal/db` (pool, migrate), `internal/ledger` (all financial SQL, inline), `internal/httpapi` (router/handlers), `internal/testutil` (test DB helper), `migrations/`, `docs/architecture.md`.
+Layout: `cmd/api` (entrypoint, graceful shutdown), `internal/config`, `internal/db` (pool, migrate), `internal/ledger` (all financial SQL, inline), `internal/outbox` (worker + demo consumer), `internal/httpapi` (router/handlers), `internal/testutil` (test DB helpers), `migrations/`, `docs/architecture.md`.
 
 ### HTTP API (current)
 - `GET /health`
 - `POST /api/transfers` — requires `X-User-ID` and `Idempotency-Key` headers; body `{source_account_id, destination_account_id, amount, currency}`; `amount` is an integer in paise; only `INR`. Returns 201 (replays add `Idempotent-Replayed: true`).
 - `GET /api/accounts/{id}` — requires `X-User-ID`; owner only (non-owner gets 404).
 - `POST /dev/users`, `POST /dev/accounts` — only when `DEV_ENDPOINTS=true`; accounts are funded by a real double-entry deposit from the seeded system account.
+- `GET /dev/outbox/failed`, `POST /dev/outbox/{id}/retry` — only when `DEV_ENDPOINTS=true`; list outbox events that exhausted their attempts, and deliberately re-queue one (404 `not_failed` if it isn't in the failed state). Unauthenticated, like the other `/dev` routes.
 
 Do not add technologies without a specific requirement and written justification.
 
@@ -70,33 +71,43 @@ go vet ./...
 go test ./... -race -count=1
 ```
 
-Database-backed tests need a real PostgreSQL test database via `TEST_DATABASE_URL` (see README for setup, e.g. `postgres://ledgerflow:ledgerflow@localhost:5433/ledgerflow_test?sslmode=disable`). **If it is unset, those tests call `t.Skip` and `go test` still reports `ok`.** A passing run that skipped integration tests is NOT verification — use `-v` and confirm the DB tests show `PASS`, not `SKIP`. The tests isolate themselves by creating their own users/accounts (no truncation) and migrate once per run.
+Database-backed tests need a real PostgreSQL test database via `TEST_DATABASE_URL` (see README for setup, e.g. `postgres://ledgerflow:ledgerflow@localhost:5433/ledgerflow_test?sslmode=disable`). **If it is unset, those tests call `t.Skip` and `go test` still reports `ok`.** A passing run that skipped integration tests is NOT verification — use `-v` and confirm the DB tests show `PASS`, not `SKIP`. The ledger/HTTP tests isolate themselves by creating their own users/accounts (no truncation) and migrate once per run. The **outbox tests are different**: the worker claims *every* pending row, so they run in their own databases, `<TEST_DATABASE_URL database>_outbox` and `_outbox_migrate`, which `testutil` creates if missing (the DB user needs `CREATEDB`) and which the outbox tests wipe of outbox/consumer rows between tests. Don't point them at a database holding data you care about, and don't run the API against these databases.
 
-Status: the suite passed against live PostgreSQL in the original scratch workspace before the copy. **It has not yet been demonstrated against a live database from this permanent copy** (the last run here skipped the DB tests because Postgres wasn't running). Don't claim otherwise until it is shown.
+Status: when the outbox worker was committed (885ab3c), the full suite was run from this copy against live PostgreSQL on port 5433 with `-race`: 32 tests, all `PASS`, none skipped. That is a point-in-time result; re-run before claiming it again after further changes.
 
-Existing tests cover: successful transfer, rejection cases (insufficient funds, bad amounts, same account, currency mismatch, unknown account, wrong owner, inactive account), rollback after a late failure (injected outbox failure), ledger immutability, unbalanced-ledger rejection, idempotent replay, key reuse, per-user key scope, concurrent identical-key requests, competing withdrawals, concurrent opposing transfers, and HTTP-level behavior (auth headers, malformed amounts, owner-only reads).
+Existing tests cover: successful transfer, rejection cases (insufficient funds, bad amounts, same account, currency mismatch, unknown account, wrong owner, inactive account), rollback after a late failure (injected outbox failure), ledger immutability, unbalanced-ledger rejection, idempotent replay, key reuse, per-user key scope, concurrent identical-key requests, competing withdrawals, concurrent opposing transfers, and HTTP-level behavior (auth headers, malformed amounts, owner-only reads). Outbox tests (`internal/outbox`) cover: atomic outbox insertion with transfers, end-to-end processing, duplicate delivery and lost-ack redelivery, consumer effect/dedupe atomicity, five concurrent workers handling 200 events exactly once, transient failure then retry, backoff deferral, handler panic as failure, expired-claim recovery, stale-worker and same-worker-id fencing, retry exhaustion with inspection and deliberate retry, crash on the final attempt, run-loop start/stop, shutdown releasing in-flight claims, and the migration preserving existing rows and being reversible. Lease expiry and backoff are simulated by editing `locked_until` / `next_attempt_at` rather than sleeping.
 
 ## 6. Current implementation and known gaps
 
-Implemented: HTTP API with the dev identity header; account and transfer logic; migrations (`users`, `accounts`, `transactions`, `ledger_entries`, `idempotency_keys`, `audit_logs`, `outbox_events`, system account seed); idempotency; double-entry ledger; transactional transfer; audit rows (successful transfers only); outbox event **persistence**; initial automated tests.
+Implemented: HTTP API with the dev identity header; account and transfer logic; migrations 000001-000004 (`users`, `accounts`, `transactions`, `ledger_entries`, `idempotency_keys`, `audit_logs`, `outbox_events` + worker state, `consumer_processed_events`, `account_activity`, system account seed); idempotency; double-entry ledger; transactional transfer; audit rows (successful transfers only); the outbox worker and a PostgreSQL-local demo consumer; automated tests.
 
-Not implemented / not yet verified:
-- **Outbox worker and delivery semantics.** Events are only written (`published_at IS NULL`); nothing publishes, retries or marks them. Do not call the outbox "processed". Design note for the worker: do not poll with `id > last_seen` (identity ids are assigned at insert, not commit, so late commits can be skipped); poll `WHERE published_at IS NULL` using `FOR UPDATE SKIP LOCKED`, and assume at-least-once delivery (consumers must dedupe). Payload currently lacks the initiating user and timestamp.
-- **Reconciliation** between ledger-derived and materialized balances (also should detect zero-entry transactions and mixed-currency entries).
+### Outbox worker (`internal/outbox`) — implemented
+- **Producer side (unchanged invariant):** the outbox row is inserted inside the transfer's transaction, so a transfer and its event commit or roll back together.
+- **States** (`outbox_events.status`): `pending`, `published`, `failed`. Extra columns: `attempts`, `next_attempt_at`, `locked_by`, `locked_until`, `last_error`. CHECK constraints tie `published` to `published_at` and allow a lease only on pending rows. Details are in `docs/architecture.md` and migration `000003`.
+- **Claiming:** `Worker.Claim` runs a short transaction using `FOR UPDATE SKIP LOCKED` (ordered by `next_attempt_at, id`) that sets the lease and increments `attempts`, then commits; no row locks are held while the handler runs. Eligibility is `status='pending' AND next_attempt_at <= now() AND (no lease or lease expired) AND attempts < MaxAttempts`, all on database time. It never uses an `id > last_seen` cursor (identity ids are assigned at insert, not commit).
+- **Lease expiry / crash recovery:** an expired lease makes the event claimable again by any worker. Because `attempts` is incremented at claim time, a crash still consumes an attempt. An expired lease on a row with `attempts >= MaxAttempts` is moved to `failed` at the start of the next claim.
+- **Retries:** on handler error (or panic) with attempts left, the event returns to `pending` with `next_attempt_at = now() + min(MaxBackoff, BaseBackoff * 2^(attempt-1))` and `last_error` set. At `attempts >= MaxAttempts` it becomes `failed` — kept, never discarded, and never claimed again unless deliberately retried.
+- **Failed-event inspection / retry:** `outbox.ListFailed` / `outbox.RetryFailed` (retry resets `attempts` to 0, keeps `last_error`), exposed via the dev-only endpoints in §2.
+- **Fencing against stale workers:** `Ack`, `Fail` and the shutdown `release` update only `WHERE locked_by = <me> AND attempts = <claimed attempt> AND status = 'pending'`; otherwise they return `ErrLeaseLost`. The attempt number is the fencing token, so a stale claim fails even if the same worker id reclaimed the event. Do not weaken these predicates (verified by mutation).
+- **Shutdown:** on context cancellation the worker releases unstarted and in-flight claims without counting the attempt. Handlers run under a timeout equal to the lease.
+- **Demo consumer:** `Consumer.Handle` handles `*.completed` events and maintains `account_activity` (per-account debit/credit counts and totals). It inserts `(consumer, event_id)` into `consumer_processed_events` and applies the effect **in one transaction**; a redelivery hits the primary key and does nothing, and a failure rolls both back. Accounts are updated in id order to avoid deadlocks. Other event types are ignored (and acknowledged).
+- **Delivery semantics: at-least-once, NOT exactly-once.** The consumer's commit and the worker's `published` mark are separate transactions that application code cannot make atomic. A crash between them causes redelivery, and the consumer's dedupe table is what makes that safe. Any new handler must be idempotent in the same way. Events are not strictly ordered (concurrent workers; failures retry later).
+- **Integration and config:** `cmd/api/main.go` starts the worker in a goroutine on a context independent of HTTP requests and, on shutdown, cancels it and waits for it before the pool closes. Settings (`internal/config`): `OUTBOX_WORKER_ENABLED` (default true), `OUTBOX_POLL_INTERVAL` (1s), `OUTBOX_BATCH_SIZE` (10), `OUTBOX_LEASE` (30s), `OUTBOX_MAX_ATTEMPTS` (5), `OUTBOX_BASE_BACKOFF` (1s), `OUTBOX_MAX_BACKOFF` (1m). The worker polls (no `LISTEN/NOTIFY`): it drains while work exists, otherwise waits `OUTBOX_POLL_INTERVAL`.
+
+### Not implemented / not yet verified
+- **External delivery.** The only consumer is the local PostgreSQL demo; there is no HTTP/broker publisher. Failed events have no alerting; published rows are never pruned. The payload still lacks the initiating user and a timestamp.
+- **Reconciliation** between ledger-derived and materialized balances (also should detect zero-entry transactions and mixed-currency entries). This is the major unfinished core feature.
 - **Frontend** — none.
-- **Live PostgreSQL verification from this copy** (see §5).
-- Other known gaps: no real authentication; failed transfers are not audited; unknown-but-well-formed `X-User-ID` yields 500 (FK error) instead of 401; trailing JSON after the request body is ignored; no cap on amounts (BIGINT overflow → 500, no corruption); no `lock_timeout`/`statement_timeout`/HTTP read-write timeouts; no startup warning that `X-User-ID` is trusted; INR only; idempotency keys never expire; dev funding serializes on one shared system account; no CI.
+- Other known gaps: no real authentication; failed transfers are not audited; unknown-but-well-formed `X-User-ID` yields 500 (FK error) instead of 401; trailing JSON after the request body is ignored; no cap on amounts (BIGINT overflow → 500, no corruption); no `lock_timeout`/`statement_timeout`/HTTP read-write timeouts; no startup warning that `X-User-ID` is trusted; INR only; idempotency keys never expire; dev funding serializes on one shared system account; no CI; `docker-compose.yml` does not forward `OUTBOX_*` settings. Nothing here is production-ready.
 
 ## 7. Development priorities
 
-Follow this order unless evidence justifies changing it:
-A. Establish a trustworthy test baseline (run the full suite against live PostgreSQL from this copy, with DB tests executing, not skipping).
-B. Complete and test outbox processing.
-C. Implement reconciliation and demonstrate its value (e.g. detect an injected inconsistency).
-D. Add focused operational safeguards (timeouts, the small known gaps above).
-E. Build a minimal but polished frontend.
+Done: A (test baseline verified live from this copy, as of 885ab3c) and B (outbox worker + idempotent demo consumer, at-least-once). Remaining order, unless evidence justifies changing it:
+C. Implement reconciliation and demonstrate its value (e.g. detect an injected balance/ledger inconsistency, zero-entry transaction, or mixed-currency entries). Major unfinished feature.
+D. Review and close important correctness and operational gaps: timeouts (`lock_timeout`, `statement_timeout`, HTTP), the small API gaps in §6, outbox operational concerns (alerting on failed events, pruning), and anything found by re-reviewing the worker under failure.
+E. Build a minimal but polished frontend (future work).
 F. Document architecture, failure handling, and test results.
-G. Prepare a reproducible demo and resume bullets.
+G. Prepare a reproducible demo and resume bullets (portfolio polish, future work).
 
 Keep scope realistic: this project must not consume the whole month; another resume-worthy project needs time. Cut features before cutting correctness.
 
