@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -15,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"ledgerflow/internal/ledger"
+	"ledgerflow/internal/outbox"
 )
 
 type API struct {
@@ -36,6 +38,8 @@ func New(pool *pgxpool.Pool, devEndpoints bool) http.Handler {
 		r.Route("/dev", func(r chi.Router) {
 			r.Post("/users", a.devCreateUser)
 			r.Post("/accounts", a.devCreateAccount)
+			r.Get("/outbox/failed", a.devListFailedEvents)
+			r.Post("/outbox/{id}/retry", a.devRetryFailedEvent)
 		})
 	}
 	return r
@@ -152,6 +156,31 @@ func (a *API) devCreateAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, acct)
+}
+
+func (a *API) devListFailedEvents(w http.ResponseWriter, r *http.Request) {
+	failed, err := outbox.ListFailed(r.Context(), a.pool, 100)
+	if err != nil {
+		a.writeLedgerError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, failed)
+}
+
+func (a *API) devRetryFailedEvent(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_id", "event id must be an integer")
+		return
+	}
+	switch err := outbox.RetryFailed(r.Context(), a.pool, id); {
+	case errors.Is(err, outbox.ErrNotFailed):
+		writeError(w, http.StatusNotFound, "not_failed", err.Error())
+	case err != nil:
+		a.writeLedgerError(w, r, err)
+	default:
+		writeJSON(w, http.StatusOK, map[string]any{"id": id, "status": "pending"})
+	}
 }
 
 func (a *API) writeLedgerError(w http.ResponseWriter, r *http.Request, err error) {

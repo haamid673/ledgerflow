@@ -13,6 +13,7 @@ import (
 	"ledgerflow/internal/config"
 	"ledgerflow/internal/db"
 	"ledgerflow/internal/httpapi"
+	"ledgerflow/internal/outbox"
 )
 
 func main() {
@@ -41,6 +42,21 @@ func run() error {
 		return err
 	}
 	defer pool.Close()
+
+	// The worker runs on its own context, independent of any HTTP request. It is stopped
+	// (and waited for) on shutdown so in-flight claims are released cleanly before the pool closes.
+	workerCtx, stopWorker := context.WithCancel(ctx)
+	workerDone := make(chan struct{})
+	if cfg.OutboxWorker {
+		worker := outbox.NewWorker(pool, outbox.Config{
+			PollInterval: cfg.OutboxPoll, BatchSize: cfg.OutboxBatchSize, Lease: cfg.OutboxLease,
+			MaxAttempts: cfg.OutboxMaxAttempts, BaseBackoff: cfg.OutboxBaseBackoff, MaxBackoff: cfg.OutboxMaxBackoff,
+		}, outbox.NewConsumer(pool).Handle)
+		go func() { defer close(workerDone); _ = worker.Run(workerCtx) }()
+	} else {
+		close(workerDone)
+	}
+	defer func() { stopWorker(); <-workerDone }()
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,

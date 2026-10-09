@@ -13,6 +13,7 @@ cmd/api/            entrypoint: config, migrations, HTTP server, graceful shutdo
 internal/config/    env-based configuration
 internal/db/        pgx pool + embedded golang-migrate migrations
 internal/ledger/    transfer logic (all SQL inline) + dev helpers
+internal/outbox/    outbox worker (claim/lease/retry) + idempotent demo consumer
 internal/httpapi/   chi router and handlers
 internal/testutil/  real-PostgreSQL test helper
 migrations/         SQL migrations (embedded into the binary)
@@ -34,6 +35,20 @@ set -a; source .env; set +a
 go run ./cmd/api
 ```
 
+### Outbox worker
+
+The API process runs the outbox worker in the background (`OUTBOX_WORKER_ENABLED=false` disables it). It claims committed events with `FOR UPDATE SKIP LOCKED`, hands them to the demo consumer (which maintains the `account_activity` table) and marks them published. Configuration (all optional):
+
+| variable | default | meaning |
+|---|---|---|
+| `OUTBOX_POLL_INTERVAL` | `1s` | idle wait between polls |
+| `OUTBOX_BATCH_SIZE` | `10` | events claimed per poll |
+| `OUTBOX_LEASE` | `30s` | claim validity; also the per-event handler timeout |
+| `OUTBOX_MAX_ATTEMPTS` | `5` | attempts before an event is marked `failed` |
+| `OUTBOX_BASE_BACKOFF` / `OUTBOX_MAX_BACKOFF` | `1s` / `1m` | exponential retry delay bounds |
+
+Failed events are kept, not discarded. With `DEV_ENDPOINTS=true`: `GET /dev/outbox/failed` lists them and `POST /dev/outbox/{id}/retry` re-queues one. Delivery is **at-least-once**; see [docs/architecture.md](docs/architecture.md) for states, leases and the consumer's idempotency design.
+
 ### Tests
 
 Tests use a real PostgreSQL database (they skip if `TEST_DATABASE_URL` is unset). Use a separate database:
@@ -44,6 +59,8 @@ docker compose exec postgres psql -U ledgerflow -d ledgerflow -c 'CREATE DATABAS
 export TEST_DATABASE_URL='postgres://ledgerflow:ledgerflow@localhost:5433/ledgerflow_test?sslmode=disable'
 go test ./... -race -count=1
 ```
+
+The outbox worker tests claim *every* pending row, so they use their own database, `<TEST_DATABASE_URL database>_outbox` (and `_outbox_migrate` for the migration test). The test helper creates these automatically if missing, so the database user needs `CREATEDB`. Check with `-v` that tests show `PASS`, not `SKIP`.
 
 ## Database and migrations
 
@@ -78,12 +95,13 @@ Errors are `{"error":{"code","message"}}`: `400` invalid amount / same account /
 - Atomic transfer: transaction row + debit/credit ledger entries + balance updates + audit row + outbox event + idempotency record, all in one PostgreSQL transaction.
 - Row-level locking; balances stay correct under concurrent load.
 - Idempotent retries, including concurrent duplicates.
+- Outbox worker: leases with crash recovery, fenced acknowledgements, bounded exponential backoff, a visible `failed` state with deliberate retry, and an idempotent PostgreSQL-local demo consumer (at-least-once delivery).
 - Append-only ledger enforced by database triggers; per-transaction debit = credit enforced at commit by a deferred constraint trigger.
 
 ## Known limitations
 
 - No authentication (`X-User-ID` header only); no authorization beyond "source account must belong to the caller".
-- Outbox events are written but nothing publishes them (no worker yet). No reconciliation job yet.
+- The outbox consumer is a local PostgreSQL demo only; there is no external delivery (HTTP, broker). Delivery is at-least-once, not exactly-once, and events are not strictly ordered. Failed events need a human (or the dev endpoint) to retry them; there is no alerting. Published rows are never pruned. No reconciliation job yet.
 - Only successful transfers are audited; rejected requests are logged by HTTP status only, and their idempotency keys are not stored (a client may retry the same key after a rejection).
 - INR only; no conversion, fees, holds or reversals. Idempotency keys never expire.
 - Dev funding goes through a single shared system account, which serializes opening-balance deposits (dev-only path).
