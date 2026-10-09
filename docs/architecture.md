@@ -79,6 +79,31 @@ The demo consumer (`account_activity` read model) does this by inserting `(consu
 
 Ordering is not guaranteed: workers run concurrently and failed events retry later.
 
-## ## Audit logging
+## Reconciliation (core engine)
+
+`internal/reconcile` re-derives what the ledger implies and compares it with what is stored. It **detects and reports; it never repairs.** There is no HTTP endpoint, scheduler or persisted run yet; `reconcile.Run(ctx, pool, opts)` returns a `Report`.
+
+- **Isolation:** one `REPEATABLE READ, READ ONLY` transaction for the whole report, with a transaction-local `statement_timeout` (default 30s). Every query sees one snapshot, so transfers committing mid-report cannot cause false mismatches (`READ COMMITTED` would take a new snapshot per statement). It takes no row locks and cannot write. `Check(ctx, tx, opts)` is the same logic on a caller-supplied transaction (tests use it to inspect uncommitted corruption) and refuses a `READ COMMITTED` transaction.
+- **Independent derivation:** expected balance = `SUM(CREDIT) - SUM(DEBIT)` over `ledger_entries`, computed in SQL with `NUMERIC` (no BIGINT overflow; sums are reported as decimal strings). Accounts are `LEFT JOIN`ed to the sums, so accounts with no entries and the system funding account are always compared. None of the transfer writer's code is reused.
+- **Findings are data, not errors.** The report has a `Consistent` flag, snapshot metadata (database clock, `pg_current_snapshot()`, highest visible entry id, and the isolation/read-only/timeout settings PostgreSQL reports; informational only, **not** a safe cursor for incremental runs because identity ids are assigned at insert, not commit), accounts/transactions/entries checked, exact per-category counts, per-currency credit/debit totals, and a deterministic list of discrepancies capped at 100 (`Truncated` says if more exist).
+
+| Category | Detects |
+|---|---|
+| `BALANCE_MISMATCH` | stored `accounts.balance` ≠ ledger-derived balance |
+| `TXN_NO_ENTRIES` | a transaction with no ledger entries (the balanced-entries trigger never sees this) |
+| `TXN_UNBALANCED` | a transaction's debit total ≠ credit total |
+| `TXN_SHAPE_MISMATCH` | not exactly one DEBIT on the source and one CREDIT on the destination, each with the transaction's amount and currency |
+| `ENTRY_CURRENCY_MISMATCH` | an entry's currency ≠ its account's currency |
+| `CURRENCY_NOT_CONSERVED` | within one entry currency, total credits ≠ total debits (the database's balance check is currency-blind) |
+| `MISSING_AUDIT_OR_OUTBOX` | a completed transaction lacking its `audit_logs` or `outbox_events` row |
+
+Assumptions and limits:
+
+- `TXN_SHAPE_MISMATCH` encodes the **two-leg model the current implementation writes**, not a universal accounting rule; multi-leg postings would require changing it. Zero-entry transactions are reported only as `TXN_NO_ENTRIES`.
+- `MISSING_AUDIT_OR_OUTBOX` is separate from the balance checks (`Options.SkipAuditOutbox` disables it). It checks presence only (audit: `entity_type='transaction'`, `entity_id`, `success`, `action='<type>.completed'`; outbox: `aggregate_type='transaction'`, `aggregate_id`, `event_type='<type>.completed'`) and assumes those tables are never pruned. `account_activity` (an eventually consistent read model) is deliberately not compared.
+- A clean report shows that stored state agrees with the ledger and the structural checks; it cannot show that a consistently posted wrong amount is correct.
+- Cost is a full scan of `ledger_entries` per report. No index was added: there is no measurement on a large dataset yet.
+
+## Audit logging
 
 `audit_logs` records `user_id`, `action` (`transfer.completed`), the transaction as `entity`, `success`, JSON details (accounts, amount, currency) and a timestamp, written in the same transaction. Only successful operations are audited at present.
