@@ -70,7 +70,7 @@ Migrations live in `migrations/` and are applied with golang-migrate on API star
 
 ## API
 
-There is **no real authentication**. `X-User-ID` is a development stand-in for the authenticated user. Dev endpoints (`/dev/*`) exist only when `DEV_ENDPOINTS=true`.
+There is **no real authentication**. `X-User-ID` is a development stand-in for the authenticated user. Dev endpoints (`/dev/*`) exist only when `DEV_ENDPOINTS=true`. `GET /dev/reconciliation` returns a read-only ledger reconciliation report (see [docs/architecture.md](docs/architecture.md)); it is unauthenticated and lists every account.
 
 ```bash
 # seed
@@ -101,7 +101,7 @@ Errors are `{"error":{"code","message"}}`: `400` invalid amount / same account /
 ## Known limitations
 
 - No authentication (`X-User-ID` header only); no authorization beyond "source account must belong to the caller".
-- The outbox consumer is a local PostgreSQL demo only; there is no external delivery (HTTP, broker). Delivery is at-least-once, not exactly-once, and events are not strictly ordered. Failed events need a human (or the dev endpoint) to retry them; there is no alerting. Published rows are never pruned. No reconciliation job yet.
+- The outbox consumer is a local PostgreSQL demo only; there is no external delivery (HTTP, broker). Delivery is at-least-once, not exactly-once, and events are not strictly ordered. Failed events need a human (or the dev endpoint) to retry them; there is no alerting. Published rows are never pruned. Reconciliation is on-demand only (the dev endpoint `GET /dev/reconciliation`); there is no scheduled job, persisted history or alerting.
 - Only successful transfers are audited; rejected requests are logged by HTTP status only, and their idempotency keys are not stored (a client may retry the same key after a rejection).
 - INR only; no conversion, fees, holds or reversals. Idempotency keys never expire.
 - Dev funding goes through a single shared system account, which serializes opening-balance deposits (dev-only path).

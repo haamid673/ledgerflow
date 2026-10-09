@@ -13,19 +13,32 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"ledgerflow/internal/ledger"
 	"ledgerflow/internal/outbox"
+	"ledgerflow/internal/reconcile"
 )
 
 type API struct {
 	pool   *pgxpool.Pool
 	ledger *ledger.Ledger
+	// reconcile produces the reconciliation report. New wires it to reconcile.Run on the
+	// shared pool; it is a field only so tests can run the real checks inside an uncommitted
+	// transaction that holds injected corruption.
+	reconcile func(ctx context.Context) (*reconcile.Report, error)
 }
 
 func New(pool *pgxpool.Pool, devEndpoints bool) http.Handler {
 	a := &API{pool: pool, ledger: ledger.New(pool)}
+	a.reconcile = func(ctx context.Context) (*reconcile.Report, error) {
+		return reconcile.Run(ctx, pool, reconcile.Options{})
+	}
+	return a.routes(devEndpoints)
+}
+
+func (a *API) routes(devEndpoints bool) http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID, middleware.Recoverer)
 
@@ -40,6 +53,7 @@ func New(pool *pgxpool.Pool, devEndpoints bool) http.Handler {
 			r.Post("/accounts", a.devCreateAccount)
 			r.Get("/outbox/failed", a.devListFailedEvents)
 			r.Post("/outbox/{id}/retry", a.devRetryFailedEvent)
+			r.Get("/reconciliation", a.devReconciliation)
 		})
 	}
 	return r
@@ -181,6 +195,25 @@ func (a *API) devRetryFailedEvent(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, http.StatusOK, map[string]any{"id": id, "status": "pending"})
 	}
+}
+
+// devReconciliation returns the full reconciliation report (every account and transaction).
+// It is unauthenticated and X-User-ID is not consulted: it exists only under /dev, which is
+// registered only when DEV_ENDPOINTS=true. Discrepancies are findings and are returned with
+// 200 and consistent=false; only a failure to produce the report is an error.
+func (a *API) devReconciliation(w http.ResponseWriter, r *http.Request) {
+	report, err := a.reconcile(r.Context())
+	if err != nil {
+		slog.Error("reconciliation failed", "err", err) // details stay in the server log
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "57014" { // query_canceled: statement_timeout
+			writeError(w, http.StatusServiceUnavailable, "reconciliation_timeout", "reconciliation exceeded its time limit")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "internal_error", "internal error")
+		return
+	}
+	writeJSON(w, http.StatusOK, report)
 }
 
 func (a *API) writeLedgerError(w http.ResponseWriter, r *http.Request, err error) {

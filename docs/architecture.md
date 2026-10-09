@@ -81,9 +81,9 @@ Ordering is not guaranteed: workers run concurrently and failed events retry lat
 
 ## Reconciliation (core engine)
 
-`internal/reconcile` re-derives what the ledger implies and compares it with what is stored. It **detects and reports; it never repairs.** There is no HTTP endpoint, scheduler or persisted run yet; `reconcile.Run(ctx, pool, opts)` returns a `Report`.
+`internal/reconcile` re-derives what the ledger implies and compares it with what is stored. It **detects and reports; it never repairs.** `reconcile.Run(ctx, pool, opts)` returns a `Report`. It is exposed only as the development endpoint `GET /dev/reconciliation` (see below); there is no scheduler or persisted run yet.
 
-- **Isolation:** one `REPEATABLE READ, READ ONLY` transaction for the whole report, with a transaction-local `statement_timeout` (default 30s). Every query sees one snapshot, so transfers committing mid-report cannot cause false mismatches (`READ COMMITTED` would take a new snapshot per statement). It takes no row locks and cannot write. `Check(ctx, tx, opts)` is the same logic on a caller-supplied transaction (tests use it to inspect uncommitted corruption) and refuses a `READ COMMITTED` transaction.
+- **Isolation:** one `REPEATABLE READ, READ ONLY` transaction for the whole report, with a transaction-local `statement_timeout` (default 30s, applied **per statement**, not to the whole report). Every query sees one snapshot, so transfers committing mid-report cannot cause false mismatches (`READ COMMITTED` would take a new snapshot per statement). It takes no row locks and cannot write. `Check(ctx, tx, opts)` is the same logic on a caller-supplied transaction (tests use it to inspect uncommitted corruption) and refuses a `READ COMMITTED` transaction.
 - **Independent derivation:** expected balance = `SUM(CREDIT) - SUM(DEBIT)` over `ledger_entries`, computed in SQL with `NUMERIC` (no BIGINT overflow; sums are reported as decimal strings). Accounts are `LEFT JOIN`ed to the sums, so accounts with no entries and the system funding account are always compared. None of the transfer writer's code is reused.
 - **Findings are data, not errors.** The report has a `Consistent` flag, snapshot metadata (database clock, `pg_current_snapshot()`, highest visible entry id, and the isolation/read-only/timeout settings PostgreSQL reports; informational only, **not** a safe cursor for incremental runs because identity ids are assigned at insert, not commit), accounts/transactions/entries checked, exact per-category counts, per-currency credit/debit totals, and a deterministic list of discrepancies capped at 100 (`Truncated` says if more exist).
 
@@ -96,6 +96,14 @@ Ordering is not guaranteed: workers run concurrently and failed events retry lat
 | `ENTRY_CURRENCY_MISMATCH` | an entry's currency ≠ its account's currency |
 | `CURRENCY_NOT_CONSERVED` | within one entry currency, total credits ≠ total debits (the database's balance check is currency-blind) |
 | `MISSING_AUDIT_OR_OUTBOX` | a completed transaction lacking its `audit_logs` or `outbox_events` row |
+
+### `GET /dev/reconciliation`
+
+Registered only when `DEV_ENDPOINTS=true` (otherwise the route does not exist: 404). It is never under `/api`. It is **unauthenticated and does not read `X-User-ID`**, and it lists every account, so it is a development tool, not a user-facing feature; enabling `DEV_ENDPOINTS` does not make the application production-safe. It runs `reconcile.Run` on the shared pool with default options (limit 100, 30s statement timeout) and returns the `Report` as JSON.
+
+- A completed report with discrepancies is **200** with `"consistent": false` and the findings in the body; discrepancies are never errors.
+- Failing to produce a report is an error with the usual `{"error":{"code","message"}}` envelope and no database detail (details go to the server log): **503** `reconciliation_timeout` if PostgreSQL cancelled a statement for exceeding `statement_timeout`, otherwise **500** `internal_error`.
+- Only `GET` is routed (other methods: 405). There are no query parameters yet, so the cap and timeout are not adjustable over HTTP.
 
 Assumptions and limits:
 
