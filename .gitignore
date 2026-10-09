@@ -1,0 +1,16 @@
+# Secrets / local environment
+.env
+.env.*
+!.env.example
+
+# Build and tooling output
+/bin/
+vendor/
+build/
+dist/
+coverage.out
+*.test
+*.out
+
+# OS
+.DS_Store
