@@ -2,7 +2,7 @@
 
 A financial-transaction backend built to demonstrate **correctness under retries, concurrency and partial failure**. It is an educational portfolio project, **not production banking software**.
 
-Go, `net/http` + chi, pgx (no ORM), PostgreSQL 16, golang-migrate, Docker Compose.
+Go, `net/http` + chi, pgx (no ORM), PostgreSQL 16, golang-migrate, Docker Compose. Building or testing on the host needs Go 1.27 or newer (`go.mod` declares `go 1.27.2`); the Docker image builds with `golang:1.27-alpine`. Licensed under the [MIT License](LICENSE).
 
 ## What it does
 
@@ -14,7 +14,7 @@ Go, `net/http` + chi, pgx (no ORM), PostgreSQL 16, golang-migrate, Docker Compos
 - **Independent reconciliation:** a read-only report, taken from one `REPEATABLE READ` snapshot, re-derives balances from the ledger and compares them with stored state. It detects and reports; it never repairs.
 
 > **Development-only defaults. Do not expose this to a network you don't control.**
-> `docker-compose.yml` sets `DEV_ENDPOINTS` to `true` unless you override it (for example `DEV_ENDPOINTS=false docker compose up -d`), and `.env.example` sets it to `true` too. The `/dev/*` routes are **unauthenticated**: they create users and accounts, inspect and retry outbox events, and `GET /dev/reconciliation` returns data about **every account**. `X-User-ID` is a development stand-in for identity, not authentication. Enabling or disabling `DEV_ENDPOINTS` does not make the application production-secure.
+> `docker-compose.yml` sets `DEV_ENDPOINTS` to `true` unless you override it (for example `DEV_ENDPOINTS=false docker compose up -d`), and `.env.example` sets it to `true` too. Compose publishes the API and Postgres ports on `127.0.0.1` only, and the API logs a warning at startup whenever development endpoints are enabled, but the routes remain unauthenticated. The `/dev/*` routes are **unauthenticated**: they create users and accounts, inspect and retry outbox events, and `GET /dev/reconciliation` returns data about **every account**. `X-User-ID` is a development stand-in for identity, not authentication. Enabling or disabling `DEV_ENDPOINTS` does not make the application production-secure.
 
 ## How it works
 
@@ -140,7 +140,7 @@ docker compose up -d --build        # Postgres (host port 5433) + API (port 8080
 curl localhost:8080/health
 ```
 
-To run the API on the host instead (Postgres still from Compose). Note that sourcing `.env` copied from `.env.example` sets `DEV_ENDPOINTS=true`; without it the dev routes are off:
+To run the API on the host instead (Postgres still from Compose). Note that sourcing `.env` copied from `.env.example` sets `DEV_ENDPOINTS=true`; without it the dev routes are off. A host run listens on `HTTP_ADDR` (default `:8080`, all interfaces); set `HTTP_ADDR=127.0.0.1:8080` to keep it local:
 
 ```bash
 docker compose up -d postgres
