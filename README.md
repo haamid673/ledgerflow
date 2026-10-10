@@ -14,7 +14,7 @@ Go, `net/http` + chi, pgx (no ORM), PostgreSQL 16, golang-migrate, Docker Compos
 - **Independent reconciliation:** a read-only report, taken from one `REPEATABLE READ` snapshot, re-derives balances from the ledger and compares them with stored state. It detects and reports; it never repairs.
 
 > **Development-only defaults. Do not expose this to a network you don't control.**
-> `docker-compose.yml` sets `DEV_ENDPOINTS` to `true` unless you override it (for example `DEV_ENDPOINTS=false docker compose up -d`), and `.env.example` sets it to `true` too. Compose publishes the API and Postgres ports on `127.0.0.1` only, and the API logs a warning at startup whenever development endpoints are enabled, but the routes remain unauthenticated. The `/dev/*` routes are **unauthenticated**: they create users and accounts, inspect and retry outbox events, and `GET /dev/reconciliation` returns data about **every account**. `X-User-ID` is a development stand-in for identity, not authentication. Enabling or disabling `DEV_ENDPOINTS` does not make the application production-secure.
+> Development endpoints are **off by default** (`DEV_ENDPOINTS=false` in the code, `docker-compose.yml` and `.env.example`), the host-run API listens on `127.0.0.1:8080` by default, and Compose publishes the API and Postgres ports on `127.0.0.1` only. The demo below needs the `/dev/*` routes, so you opt in explicitly with `DEV_ENDPOINTS=true` (see [Setup](#setup)); the API then logs a warning at startup. The `/dev/*` routes are **unauthenticated**: they create users and accounts, inspect and retry outbox events, and `GET /dev/reconciliation` returns data about **every account**. `X-User-ID` is a development stand-in for identity, not authentication. Enabling or disabling `DEV_ENDPOINTS` does not make the application production-secure.
 
 ## How it works
 
@@ -109,11 +109,11 @@ Other routes: `GET /health`, and (dev only) `GET /dev/outbox/failed`, `POST /dev
 
 ## Try it: five steps
 
-Needs Docker, `curl` and a POSIX shell (no `jq`). These steps were run against the Compose stack as written. They create data in the Compose database, and the IDs differ each run.
+Needs Docker, `curl` and a POSIX shell (no `jq`). Steps 2 to 5 use the `/dev/*` routes, so step 1 opts in with `DEV_ENDPOINTS=true`. These steps were run against the Compose stack; they create data in the Compose database, and the IDs differ each run.
 
 ```bash
-# 1. Start Postgres and the API (migrations run on start) and wait until it is healthy
-docker compose up -d --build && until curl -sf localhost:8080/health; do sleep 1; done; echo
+# 1. Start Postgres and the API with development endpoints ENABLED (migrations run on start) and wait until it is healthy
+DEV_ENDPOINTS=true docker compose up -d --build && until curl -sf localhost:8080/health; do sleep 1; done; echo
 
 # 2. Create two users, each with an account (Alice funded with 100000 paise from the system account)
 mk() { curl -s -XPOST localhost:8080/dev/"$1" -d "$2" | sed -E 's/.*"id":"([^"]+)".*/\1/'; }
@@ -130,22 +130,32 @@ curl -s localhost:8080/api/accounts/$A -H "X-User-ID: $ALICE"; echo; curl -s loc
 curl -s localhost:8080/dev/reconciliation | grep -o '"consistent":[a-z]*'
 ```
 
-Stop the API when done: `docker compose stop api`.
+Stop the API when done: `docker compose stop api`. To go back to the default (dev routes off), run `docker compose up -d` again without `DEV_ENDPOINTS=true`; the `/dev/*` routes then return 404.
 
 ## Setup
 
 ```bash
 cp .env.example .env                # optional; compose has defaults
-docker compose up -d --build        # Postgres (host port 5433) + API (port 8080)
+docker compose up -d --build        # Postgres (127.0.0.1:5433) + API (127.0.0.1:8080), dev endpoints OFF
 curl localhost:8080/health
 ```
 
-To run the API on the host instead (Postgres still from Compose). Note that sourcing `.env` copied from `.env.example` sets `DEV_ENDPOINTS=true`; without it the dev routes are off. A host run listens on `HTTP_ADDR` (default `:8080`, all interfaces); set `HTTP_ADDR=127.0.0.1:8080` to keep it local:
+**Enabling development endpoints (opt-in, local demos only).** Set `DEV_ENDPOINTS=true` for that run, either inline or in `.env`:
+
+```bash
+DEV_ENDPOINTS=true docker compose up -d --build   # inline; overrides .env
+# or set DEV_ENDPOINTS=true in .env, then: docker compose up -d --build
+```
+
+A shell variable takes precedence over `.env`. Confirm with `curl -s -o /dev/null -w '%{http_code}\n' localhost:8080/dev/outbox/failed`: `404` means off, `200` means on.
+
+To run the API on the host instead (Postgres still from Compose). The host-run API listens on `HTTP_ADDR` (default `127.0.0.1:8080`, loopback only) and has dev routes off unless `DEV_ENDPOINTS=true`:
 
 ```bash
 docker compose up -d postgres
 set -a; source .env; set +a
-go run ./cmd/api
+go run ./cmd/api                          # dev routes off
+DEV_ENDPOINTS=true go run ./cmd/api       # opt in for a demo
 ```
 
 ## Verification

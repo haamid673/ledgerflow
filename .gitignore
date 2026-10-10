@@ -11,6 +11,7 @@ dist/
 coverage.out
 *.test
 *.out
+*.log
 
 # OS
 .DS_Store

@@ -26,7 +26,7 @@ type Config struct {
 func Load() (Config, error) {
 	c := Config{
 		DatabaseURL:  os.Getenv("DATABASE_URL"),
-		HTTPAddr:     getenv("HTTP_ADDR", ":8080"),
+		HTTPAddr:     getenv("HTTP_ADDR", "127.0.0.1:8080"),
 		AutoMigrate:  getbool("AUTO_MIGRATE", true),
 		DevEndpoints: getbool("DEV_ENDPOINTS", false),
 

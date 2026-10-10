@@ -161,7 +161,7 @@ Registered only when `DEV_ENDPOINTS=true` (otherwise the route does not exist: 4
 - A completed report with discrepancies is **200** with `"consistent": false` and the findings in the body; discrepancies are never errors.
 - Failing to produce a report is an error with the usual `{"error":{"code","message"}}` envelope and no database detail (details go to the server log): **503** `reconciliation_timeout` if PostgreSQL cancelled a statement for exceeding `statement_timeout`, otherwise **500** `internal_error`.
 - Only `GET` is routed (other methods: 405). There are no query parameters yet, so the cap and timeout are not adjustable over HTTP.
-- `docker-compose.yml` sets `DEV_ENDPOINTS` to `true` unless overridden, so the default Compose stack exposes this unauthenticated all-account report along with the other `/dev` routes. Compose publishes the ports on `127.0.0.1` only and the API logs a startup warning when dev endpoints are enabled, but the routes are still unauthenticated. That default is for local development only.
+- Development endpoints are off by default (`DEV_ENDPOINTS=false` in the code, `docker-compose.yml` and `.env.example`), so this unauthenticated all-account report is exposed only when you opt in with `DEV_ENDPOINTS=true`. The host-run API listens on `127.0.0.1:8080` by default and Compose publishes the ports on `127.0.0.1` only. The API logs a startup warning when dev endpoints are enabled, but the routes are still unauthenticated and opting in is for local development only.
 
 Assumptions and limits:
 
