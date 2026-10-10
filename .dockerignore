@@ -1,0 +1,15 @@
+# Keep the build context small and free of local secrets or artifacts.
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+*.test
+*.out
+coverage.out
+bin/
+vendor/
+build/
+dist/
+.DS_Store
+**/.DS_Store
