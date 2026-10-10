@@ -2,6 +2,63 @@
 
 One Go binary, one PostgreSQL database. PostgreSQL is the single source of truth; the Go code is a thin layer that issues explicit SQL inside transactions.
 
+## Overview
+
+```mermaid
+flowchart TB
+    C["Client<br/>POST /api/transfers<br/>Idempotency-Key + X-User-ID (dev stand-in, not auth)"] --> V0["Ledger.Transfer: stateless checks<br/>before the transaction begins:<br/>amount, same account, INR only"]
+
+    subgraph TX1["ONE PostgreSQL transaction (Ledger.Transfer): commits or rolls back as a unit"]
+        direction TB
+        K["1 insert idempotency key<br/>on conflict: replay the stored response,<br/>or reject a different request"] --> L["2 lock both accounts<br/>one statement, ORDER BY id, FOR UPDATE"]
+        L --> CK["3 check owner, status, currency, balance<br/>on the locked rows"]
+        CK --> W["4 insert transaction + DEBIT and CREDIT entries<br/>relative balance updates"]
+        W --> AO["5 insert audit row + outbox event<br/>store the response on the idempotency row"]
+        AO --> CM["COMMIT<br/>deferred trigger: debits = credits per transaction"]
+    end
+    V0 --> K
+    CM --> DB[("PostgreSQL<br/>accounts, transactions, ledger_entries (append-only),<br/>audit_logs, outbox_events, idempotency_keys")]
+
+    subgraph TX2["Outbox worker + consumer (in the API process): separate transactions, at-least-once"]
+        direction TB
+        CL["A claim a batch (short tx)<br/>FOR UPDATE SKIP LOCKED, set lease, attempts + 1"] --> HD["B consumer handler (one tx)<br/>insert dedupe row (event id) + update account_activity"]
+        HD --> AK["C ack (separate tx)<br/>mark published, fenced by the claimed attempt"]
+    end
+    DB -->|"committed outbox events"| CL
+    HD -.->|"crash after B, before C: lease expires,<br/>event is redelivered, dedupe makes B a no-op"| CL
+
+    R["Reconciler: GET /dev/reconciliation (dev-only)<br/>REPEATABLE READ, READ ONLY snapshot<br/>derives balances from ledger_entries and compares them<br/>with accounts.balance, plus structural checks<br/>detects and reports, never repairs"]
+    DB -.->|"read only"| R
+```
+
+- **Atomic part:** only box 1 is one transaction. The outbox row commits with the money movement, so "money moved" and "event recorded" cannot diverge.
+- **Delivery is not atomic with the transfer:** the worker claim, the consumer's effect and the `published` mark are separate transactions. A crash between B and C causes redelivery, which is why delivery is **at-least-once, not exactly-once**, and why the consumer deduplicates.
+- **Reconciliation is outside the transfer path.** It never writes. It checks stored state against the ledger; it does not check `account_activity`, which legitimately lags.
+
+The diagram follows the code: `Ledger.Transfer` and `post()` in `internal/ledger`, `Worker`/`Consumer` in `internal/outbox`, and `reconcile.Run` in `internal/reconcile`. The sections below give the detail.
+
+## What is enforced where
+
+| Property | Enforced by | Evidence | Limits |
+|---|---|---|---|
+| Ledger entries are append-only | **Database:** triggers reject `UPDATE`, `DELETE`, `TRUNCATE` | automated test | Table owners/superusers can disable triggers. `transactions` and `accounts` rows are **not** immutable |
+| Each transaction's debits equal its credits | **Database:** deferred constraint trigger at commit | automated test (unbalanced commit rejected) | Sums amounts only and ignores currency, so 10 INR debited against 10 USD credited passes. A transaction with zero entries never fires it. It does not tie entries to the transaction's accounts or amount |
+| User balances never go negative | **Database:** `CHECK` | automated tests | The seeded system funding account may go negative |
+| A transfer is atomic (ledger, balances, audit, outbox, idempotency record) | **Application:** one PostgreSQL transaction | failure-injection test that rolls back after a late failure | Nothing in the database ties `accounts.balance` to ledger entries |
+| No overspend or deadlock under concurrency | **Application:** ordered `FOR UPDATE` locks, balance checked after the lock | concurrency tests assert exact balances and entry counts; removing the lock was manually verified to fail them | Not tested under process kill or database restart |
+| Idempotent retries, including concurrent duplicates | **Application:** key inserted first inside the transaction, unique index | automated tests | Keys never expire; a rejected request keeps no key |
+| Events delivered at-least-once; consumer effect applied once | **Application:** leases and attempt fencing; dedupe row committed with the effect | automated tests with simulated crashes and lost acks | Not exactly-once; no ordering guarantee; crashes are simulated, not real process kills |
+| Stored state agrees with the ledger | **Reconciliation,** after the fact | tests that inject corruption in never-committed transactions | Detects only: it does not prevent corruption, repair anything, or prove each transaction was originally correct. It assumes the current two-leg model |
+
+**Known gaps in the database guarantees** (these are what reconciliation exists to surface):
+- A `transactions` row with zero ledger entries can commit.
+- The balance check is currency-blind: balanced entries in mixed currencies can commit.
+- Entries are not tied to their transaction's source, destination, amount or currency.
+- `transactions` and `accounts` are mutable, and `accounts.balance` is only a cache the code keeps in step.
+- Database owners and superusers can disable the triggers.
+
+Reconciliation can show that stored balances and the structural checks agree with the ledger as it now stands. It cannot prove that every transaction was originally correct (a wrong amount posted consistently looks valid), and it does not prevent or repair anything.
+
 ## Double-entry ledger
 
 Every money movement is a `transactions` row plus two `ledger_entries` rows: a `DEBIT` on the source and a `CREDIT` on the destination for the same positive amount (`entry_type` is the direction). The invariant `SUM(debits) = SUM(credits)` is enforced by the database: a deferred constraint trigger checks each transaction's entries at commit. Entries are append-only: triggers reject `UPDATE`, `DELETE` and `TRUNCATE`. Corrections would be new, offsetting transactions.
@@ -10,7 +67,7 @@ Convention: CREDIT increases an account's balance, DEBIT decreases it. Opening b
 
 ## Materialized balance
 
-`accounts.balance` is a cached value for cheap reads; the ledger is authoritative (balance = credits − debits). It is only changed in the same transaction that inserts the entries, using relative updates (`balance = balance - $1`). A `CHECK (balance >= 0)` on user accounts is a last-line backstop. Tests verify balance == ledger-derived sum after every scenario, and that removing the row lock makes the concurrency tests fail.
+`accounts.balance` is a cached value for cheap reads; the ledger is authoritative (balance = credits − debits). It is only changed in the same transaction that inserts the entries, using relative updates (`balance = balance - $1`). A `CHECK (balance >= 0)` on user accounts is a last-line backstop. Tests compare stored and ledger-derived balances for the accounts each scenario touches, and reconciliation (below) does the same for every account. Removing the row lock was manually verified to make the concurrency tests fail; that is a one-off manual check, not an automated test.
 
 ## Transaction boundary
 
@@ -104,6 +161,7 @@ Registered only when `DEV_ENDPOINTS=true` (otherwise the route does not exist: 4
 - A completed report with discrepancies is **200** with `"consistent": false` and the findings in the body; discrepancies are never errors.
 - Failing to produce a report is an error with the usual `{"error":{"code","message"}}` envelope and no database detail (details go to the server log): **503** `reconciliation_timeout` if PostgreSQL cancelled a statement for exceeding `statement_timeout`, otherwise **500** `internal_error`.
 - Only `GET` is routed (other methods: 405). There are no query parameters yet, so the cap and timeout are not adjustable over HTTP.
+- `docker-compose.yml` sets `DEV_ENDPOINTS` to `true` unless overridden, so the default Compose stack exposes this unauthenticated all-account report along with the other `/dev` routes. That default is for local development only.
 
 Assumptions and limits:
 
@@ -115,3 +173,19 @@ Assumptions and limits:
 ## Audit logging
 
 `audit_logs` records `user_id`, `action` (`transfer.completed`), the transaction as `entity`, `success`, JSON details (accounts, amount, currency) and a timestamp, written in the same transaction. Only successful operations are audited at present.
+
+## Testing and test databases
+
+Database-backed tests need `TEST_DATABASE_URL`. **If it is unset they call `t.Skip` and `go test` still reports `ok`**, so a passing run is verification only if `-v` shows `PASS` rather than `SKIP`.
+
+Most ledger and HTTP tests share one database and isolate themselves by creating their own users and accounts (the ledger cannot be truncated). Tests that need exclusive state or a database-wide change use a database named `<TEST_DATABASE_URL database>_<suffix>`, created on demand by `testutil.IsolatedPool` (the DB user needs `CREATEDB`):
+
+| suffix | used by |
+|---|---|
+| `_outbox`, `_outbox_migrate` | outbox worker and migration tests (the worker claims every pending row) |
+| `_reconcile` | reconciliation engine tests (exact discrepancy counts) |
+| `_reconcile_http` | reconciliation endpoint tests |
+| `_e2e` | the end-to-end test that runs a real worker |
+| `_ledger_rollback` | the rollback test, which installs a database-wide trigger |
+
+Rules: inject corruption only inside transactions that are never committed (reconciliation tests do this), because committed corruption in `ledger_entries` is permanent; and never run a mutation experiment that breaks the real writer against a standing test database. The mutation checks mentioned in these docs were done manually and are not part of the test suite. There is no CI workflow, and resilience to process kills or database restarts has not been tested (crashes and lease expiry are simulated). [CLAUDE.md](../CLAUDE.md) has the detailed rules.
