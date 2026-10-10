@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least privilege: the workflow only reads the repository.
+permissions:
+  contents: read
+
+# A newer push to the same ref supersedes an in-progress run.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        # Same major version as docker-compose.yml.
+        image: postgres:16-alpine
+        env:
+          # Throwaway credentials for an ephemeral service container; not secrets.
+          # POSTGRES_USER is a superuser, so the tests may CREATE DATABASE for the
+          # isolated suffix databases (_outbox, _reconcile, _e2e, ...).
+          POSTGRES_USER: ledgerflow
+          POSTGRES_PASSWORD: ledgerflow
+          POSTGRES_DB: ledgerflow_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ledgerflow -d ledgerflow_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      TEST_DATABASE_URL: postgres://ledgerflow:ledgerflow@localhost:5432/ledgerflow_test?sslmode=disable
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # The toolchain version comes from go.mod (the Dockerfile uses golang:1.27).
+          go-version-file: go.mod
+
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test (race detector, no skipped database tests)
+        run: |
+          set -o pipefail
+          # Database-backed tests call t.Skip when TEST_DATABASE_URL is unset, and
+          # `go test` still reports ok. The variable is set above, so any skip here
+          # means the database tests did not run and must fail the build.
+          test -n "$TEST_DATABASE_URL"
+          go test ./... -race -count=1 -v 2>&1 | tee test.log
+          if grep -E -- '^\s*--- SKIP' test.log; then
+            echo "::error::Tests were skipped; database-backed tests must run in CI."
+            exit 1
+          fi
