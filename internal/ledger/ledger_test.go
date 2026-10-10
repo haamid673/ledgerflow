@@ -203,8 +203,14 @@ func TestRejectedTransfersLeaveNoTrace(t *testing.T) {
 
 // Forces a failure at the very last write (the outbox insert) and proves that the ledger
 // entries, balance changes, transaction, audit row and idempotency key were all rolled back.
+//
+// The injection is a database-wide trigger on outbox_events, so this test runs in its own
+// database: in the shared test database the trigger (and the lock taken by CREATE/DROP
+// TRIGGER) would affect other packages' tests running in parallel, and a crash before
+// cleanup would leave it installed there.
 func TestRollbackOnLateFailure(t *testing.T) {
-	e := newEnv(t)
+	pool := testutil.IsolatedPool(t, "ledger_rollback")
+	e := &env{t: t, pool: pool, l: ledger.New(pool)}
 	alice, bob := e.user(), e.user()
 	b := e.account(bob.ID, 0)
 
