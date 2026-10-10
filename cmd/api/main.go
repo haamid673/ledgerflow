@@ -58,6 +58,10 @@ func run() error {
 	}
 	defer func() { stopWorker(); <-workerDone }()
 
+	if cfg.DevEndpoints {
+		slog.Warn("development endpoints are ENABLED: /dev/* routes are unauthenticated and expose data for every account; for local development only, never expose this server to an untrusted network", "addr", cfg.HTTPAddr)
+	}
+
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           httpapi.New(pool, cfg.DevEndpoints),
