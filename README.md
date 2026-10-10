@@ -69,6 +69,7 @@ Details: [docs/architecture.md](docs/architecture.md).
 - The balance check is currency-blind: balanced entries in mixed currencies can commit.
 - Entries are not tied to their transaction's source, destination, amount or currency.
 - `transactions` and `accounts` are mutable, and `accounts.balance` is only a cache the code keeps in step.
+- `audit_logs`, `idempotency_keys`, and `outbox_events` are ordinary mutable database tables; the audit log is not tamper-evident.
 - Database owners and superusers can disable the triggers.
 
 ## Reconciliation
